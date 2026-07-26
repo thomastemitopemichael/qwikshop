@@ -112,6 +112,9 @@ async function sendPush(customerId, title, body) {
     const r = await axios.post("https://onesignal.com/api/v1/notifications", {
       app_id: appId, include_subscription_ids: subIds, headings: { en: title }, contents: { en: body }
     }, { headers: { Authorization: `Basic ${apiKey}`, "Content-Type": "application/json" } });
+    // Refresh last_seen_at on every attempted send (not just registration) so
+    // the device_retention_days cleanup prunes genuinely inactive devices only.
+    await supabaseAdmin.from("customer_devices").update({ last_seen_at: new Date().toISOString() }).eq("customer_id", customerId);
     return { success: true, id: r.data?.id };
   } catch (err) { return { success: false, error: err.response?.data?.errors?.[0] || err.message }; }
 }
@@ -998,11 +1001,39 @@ async function scheduleCrons() {
   console.log("Crons scheduled: reservation release (2min), scheduled reminders (15min), keep-alive (14min).");
 }
 
-// Daily cleanup: expired telegram link codes
-cron.schedule("0 3 * * *", async () => {
-  try { await supabaseAdmin.from("telegram_link_codes").delete().lt("expires_at", new Date().toISOString()); }
-  catch (e) { console.error("[Telegram cleanup]", e.message); }
-});
+// ── DAILY DATABASE CLEANUP (03:00 UTC) ────────────────────────────
+// Prunes the two fastest-growing tables (notifications, admin_notifications)
+// past an admin-configurable retention window, plus stale device rows.
+// A 7-day floor is enforced server-side regardless of what admin sets,
+// so a mistaken input (e.g. "0" or "1") can't wipe out same-day data.
+const RETENTION_FLOOR_DAYS = 7;
+async function clampRetentionDays(settingKey, fallback) {
+  const raw = await getSetting(settingKey);
+  const parsed = parseInt(raw);
+  const days = isNaN(parsed) ? fallback : Math.max(RETENTION_FLOOR_DAYS, parsed);
+  return days;
+}
+async function runDailyCleanup() {
+  try {
+    // Expired telegram link codes (existing behavior)
+    await supabaseAdmin.from("telegram_link_codes").delete().lt("expires_at", new Date().toISOString());
+
+    // Notifications + admin_notifications retention
+    const notifDays = await clampRetentionDays("notification_retention_days", 90);
+    const notifCutoff = new Date(Date.now() - notifDays * 86400000).toISOString();
+    const { count: notifDeleted } = await supabaseAdmin.from("notifications").delete({ count: "exact" }).lt("created_at", notifCutoff);
+    const { count: adminNotifDeleted } = await supabaseAdmin.from("admin_notifications").delete({ count: "exact" }).lt("created_at", notifCutoff);
+
+    // Stale device pruning — last_seen_at is refreshed on every push attempt
+    // (see sendPush), so this reflects real inactivity, not just registration age.
+    const deviceDays = await clampRetentionDays("device_retention_days", 60);
+    const deviceCutoff = new Date(Date.now() - deviceDays * 86400000).toISOString();
+    const { count: devicesDeleted } = await supabaseAdmin.from("customer_devices").delete({ count: "exact" }).lt("last_seen_at", deviceCutoff);
+
+    console.log(`[daily cleanup] notifications: -${notifDeleted || 0} (>${notifDays}d), admin_notifications: -${adminNotifDeleted || 0}, devices: -${devicesDeleted || 0} (>${deviceDays}d)`);
+  } catch (e) { console.error("[daily cleanup]", e.message); }
+}
+cron.schedule("0 3 * * *", runDailyCleanup);
 
 const PORT = parseInt(process.env.PORT) || 4000;
 app.listen(PORT, "0.0.0.0", async () => {
