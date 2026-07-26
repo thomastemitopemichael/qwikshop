@@ -1,22 +1,41 @@
 // ═══════════════════════════════════════════════════════════════
 // QuickShop Admin — admin.js
 // ═══════════════════════════════════════════════════════════════
-// The admin panel is typically opened as a normal web page by shop
-// staff (not embedded in the customer-facing WebView app), so unlike
-// the customer app, it's fine to let an admin set/persist their backend
-// URL locally once. window.QUICKSHOP_API_BASE (if injected) still wins.
-const API_BASE = window.QUICKSHOP_API_BASE || localStorage.getItem('qs_admin_api_base') || 'http://localhost:4000/api';
+// API_BASE is set at login time from the "API URL" field (saved to
+// localStorage so staff don't retype it every session), rather than
+// hardcoded — window.QUICKSHOP_API_BASE (if injected) still wins.
+let API_BASE = window.QUICKSHOP_API_BASE || localStorage.getItem('qs_admin_api_base') || '';
 let ADMIN_KEY = sessionStorage.getItem('qs_admin_key') || '';
 let categories = [], products = [], customers = [];
 let currentOrderTab = 'new';
+let isOnline = navigator.onLine;
 
+const REQUEST_TIMEOUT_MS = 15000;
 async function api(path, method = 'GET', body) {
   const opts = { method, headers: { 'Content-Type': 'application/json', 'x-admin-key': ADMIN_KEY } };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(API_BASE + path, opts);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Request failed');
-  return data;
+  const controller = new AbortController();
+  opts.signal = controller.signal;
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(API_BASE + path, opts);
+    clearTimeout(timer);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+    setOnlineState(true);
+    return data;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      setOnlineState(false);
+      const timeoutErr = new Error('Request timed out — check your connection.');
+      timeoutErr.isTimeout = true;
+      throw timeoutErr;
+    }
+    // A network-level failure (not an HTTP error response) also signals offline.
+    if (err instanceof TypeError) setOnlineState(false);
+    throw err;
+  }
 }
 
 function toast(msg, type = 'info') {
@@ -29,6 +48,27 @@ function toast(msg, type = 'info') {
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 function money(n) { return '₦' + Number(n || 0).toLocaleString(); }
 function setEl(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+
+// ── ONLINE / OFFLINE AWARENESS ────────────────────────────────────
+// Browser online/offline events give instant detection; actual API
+// call success/failure (in api() above) is the secondary confirming
+// signal, since a browser can report "online" while the backend is
+// still unreachable (e.g. Render cold start, bad API URL).
+function setOnlineState(online) {
+  if (online === isOnline) return;
+  isOnline = online;
+  const dot = document.getElementById('connDot');
+  const label = document.getElementById('connLabel');
+  if (dot) dot.classList.toggle('off', !online);
+  if (label) label.textContent = online ? '' : 'Offline';
+  if (online) {
+    // Reconnected — refresh whatever page is currently showing.
+    const activePage = document.querySelector('.nav-item.act, .mob-nav-item.act');
+    if (activePage) showPage(activePage.dataset.pg);
+  }
+}
+window.addEventListener('online', () => setOnlineState(true));
+window.addEventListener('offline', () => setOnlineState(false));
 
 // ── CONFIRM DIALOG ──────────────────────────────────────────────
 let _confirmResolve = null;
@@ -44,25 +84,42 @@ function resolveConfirm(val) {
 }
 
 // ── AUTH ─────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  const urlInput = document.getElementById('apiUrlInput');
+  if (urlInput && API_BASE) urlInput.value = API_BASE;
+});
+
 async function doLogin() {
+  const urlInput = document.getElementById('apiUrlInput');
+  let apiUrl = urlInput.value.trim();
+  if (!apiUrl) { showLoginWarn('Enter your backend API URL.'); return; }
+  apiUrl = apiUrl.replace(/\/+$/, ''); // strip trailing slash(es)
+
   const key = document.getElementById('adminKeyInput').value.trim();
   if (!key) { showLoginWarn('Enter your admin key.'); return; }
+
+  API_BASE = apiUrl;
   ADMIN_KEY = key;
   const btn = document.getElementById('loginBtn');
   btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Verifying...';
   try {
-    await api('/admin/overview'); // validates key
+    await api('/admin/overview'); // validates both the URL and the key
+    localStorage.setItem('qs_admin_api_base', API_BASE);
     sessionStorage.setItem('qs_admin_key', key);
     document.getElementById('loginScreen').style.display = 'none';
     document.getElementById('appScreen').classList.add('visible');
     boot();
   } catch (e) {
-    showLoginWarn('Invalid admin key. Please try again.');
+    showLoginWarn(e.isTimeout ? e.message : 'Could not connect — check the API URL and admin key.');
     btn.disabled = false; btn.innerHTML = 'Sign In';
   }
 }
 function showLoginWarn(msg) { const el = document.getElementById('loginWarn'); el.textContent = msg; el.style.display = 'block'; }
-function doLogout() { sessionStorage.removeItem('qs_admin_key'); location.reload(); }
+function doLogout() {
+  // API URL stays saved — no reason to make staff retype it every sign-out.
+  sessionStorage.removeItem('qs_admin_key');
+  location.reload();
+}
 
 async function boot() {
   await Promise.all([loadCategories(), loadProducts()]);
@@ -76,18 +133,19 @@ function showPage(pg) {
   const renderers = { overview: renderOverviewPage, orders: renderOrdersPage, products: renderProductsPage, categories: renderCategoriesPage, customers: renderCustomersPage, analytics: renderAnalyticsPage, notifications: renderNotificationsPage, settings: renderSettingsPage };
   document.getElementById('mainArea').innerHTML = renderers[pg] ? renderers[pg]() : '';
   const loaders = { overview: loadOverview, orders: () => loadOrders(currentOrderTab), products: loadProducts, categories: loadCategories, customers: loadCustomers, analytics: loadAnalytics, settings: loadSettings };
-  if (loaders[pg]) loaders[pg]();
+  if (loaders[pg] && isOnline) loaders[pg]();
 }
 
-// Auto-login if key already in session
+// Auto-login if key + URL already saved
 window.addEventListener('DOMContentLoaded', () => {
-  if (ADMIN_KEY) {
+  if (ADMIN_KEY && API_BASE) {
     api('/admin/overview').then(() => {
       document.getElementById('loginScreen').style.display = 'none';
       document.getElementById('appScreen').classList.add('visible');
       boot();
     }).catch(() => { sessionStorage.removeItem('qs_admin_key'); });
   }
+  setOnlineState(navigator.onLine);
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -582,6 +640,13 @@ function renderSettingsPage() {
       </div>
       <div class="fg"><label class="fl">Reminder Lead Time (hrs before scheduled order)</label><input class="fi" id="s-reminder_hours_before" type="number"></div>
     </div>
+    <div class="card">
+      <div class="card-head"><h3>Data Retention</h3></div>
+      <div class="fhint" style="margin-bottom:10px">Daily cleanup runs at 03:00 UTC. A 7-day floor is always enforced server-side, regardless of what's set here.</div>
+      <div class="fr">
+        <div class="fg"><label class="fl">Notification Retention (days)</label><input class="fi" id="s-notification_retention_days" type="number" min="7"></div>
+        <div class="fg"><label class="fl">Inactive Device Retention (days)</label><input class="fi" id="s-device_retention_days" type="number" min="7"></div>
+      </div>
     <div class="card">
       <div class="card-head"><h3>Notification Channels</h3></div>
       <div class="fhint" style="margin-bottom:10px">Globally enable/disable each channel. Customers still choose their own preferred channels within what's enabled here.</div>

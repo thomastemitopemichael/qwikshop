@@ -5,8 +5,8 @@
 // script runs (WebView preload script / JS bridge global). There is no
 // address bar in a WebView for a user to configure this, so we never
 // read it from localStorage or prompt for it — only the injected value
-// or a localhost fallback for local development.
-const API_BASE = window.QUICKSHOP_API_BASE || 'http://localhost:4000/api';
+// or a hardcoded fallback until the native bridge is wired up.
+const API_BASE = window.QUICKSHOP_API_BASE || 'https://qwikshop.onrender.com/api';
 
 // ── STATE ──────────────────────────────────────────────────────
 let config = { shop_name: 'QuickShop', currency_symbol: '₦', min_lead_time_hours: 2, min_order_value: 0, delivery_fee: 0 };
@@ -19,15 +19,86 @@ let notifications = [];
 let currentCategory = null;
 let currentTab = 'shop'; // shop | orders | preorder | account
 let orders = [];
+let isOnline = navigator.onLine;
+const NOTIF_CACHE_CAP = 100;
 
-// ── API HELPERS ─────────────────────────────────────────────────
+// ── API HELPERS (15s hard timeout via AbortController) ───────────
+const REQUEST_TIMEOUT_MS = 15000;
 async function api(path, method = 'GET', body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(API_BASE + path, opts);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Something went wrong');
-  return data;
+  const controller = new AbortController();
+  opts.signal = controller.signal;
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(API_BASE + path, opts);
+    clearTimeout(timer);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Something went wrong');
+    setOnlineState(true);
+    return data;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      setOnlineState(false);
+      const timeoutErr = new Error('Request timed out — check your connection.');
+      timeoutErr.isTimeout = true;
+      throw timeoutErr;
+    }
+    if (err instanceof TypeError) setOnlineState(false); // network-level failure
+    throw err;
+  }
+}
+
+// ── ONLINE / OFFLINE AWARENESS ────────────────────────────────────
+// Browser online/offline events give instant detection; actual API
+// call success/failure (above) is the secondary confirming signal,
+// since a device can report "online" while the backend is unreachable.
+function setOnlineState(online) {
+  if (online === isOnline) return;
+  isOnline = online;
+  renderOfflineIndicator();
+  if (online) {
+    // Reconnected — refresh whatever's on screen right now.
+    if (currentTab === 'shop' && !currentCategory) refreshCategoriesAndProducts();
+    else if (currentTab === 'orders') loadOrders();
+    if (customerId) refreshNotifications();
+  }
+}
+function renderOfflineIndicator() {
+  let el = document.getElementById('offlineBanner');
+  if (!isOnline) {
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'offlineBanner';
+      el.style.cssText = 'position:fixed;top:0;left:0;right:0;background:var(--amber);color:#1a1400;font-size:11px;font-weight:700;text-align:center;padding:4px;z-index:600;letter-spacing:.3px';
+      el.textContent = '⚠ Offline — showing saved data';
+      document.body.prepend(el);
+    }
+  } else if (el) { el.remove(); }
+}
+window.addEventListener('online', () => setOnlineState(true));
+window.addEventListener('offline', () => setOnlineState(false));
+
+// ── PER-CUSTOMER LOCALSTORAGE CACHE ───────────────────────────────
+// Only active once a customer_id exists (post first order/pre-order) —
+// there's no stable identity to scope a cache key to before that, so
+// pre-order browsing always hits the network live.
+function cacheKey(resource) { return customerId ? `qs_cache_${customerId}_${resource}` : null; }
+function cacheGet(resource) {
+  const key = cacheKey(resource);
+  if (!key) return null;
+  try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : null; } catch { return null; }
+}
+function cacheSet(resource, data) {
+  const key = cacheKey(resource);
+  if (!key) return;
+  try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) { console.warn('Cache write failed', e); }
+}
+function clearCustomerCache() {
+  if (!customerId) return;
+  const prefix = `qs_cache_${customerId}_`;
+  Object.keys(localStorage).filter(k => k.startsWith(prefix)).forEach(k => localStorage.removeItem(k));
 }
 
 // ── TOAST ────────────────────────────────────────────────────────
@@ -95,15 +166,17 @@ function updateCartBadge() {
   }
 }
 
-// ── INIT ─────────────────────────────────────────────────────────
+// ── INIT (stale-while-revalidate) ─────────────────────────────────
+// Render cached data instantly if present, then refresh in the
+// background and silently update the UI. Data arrays are only ever
+// reset to empty if the fetch fails AND there's no cache at all.
 async function init() {
-  try {
-    config = await api('/config');
-  } catch (e) { console.warn('Config load failed, using defaults', e); }
-  try {
-    categories = await api('/categories');
-    products = await api('/products');
-  } catch (e) { toast('Could not load shop data. Check your connection.', 'error'); }
+  const cachedCategories = cacheGet('categories');
+  const cachedProducts = cacheGet('products');
+  if (cachedCategories) categories = cachedCategories;
+  if (cachedProducts) products = cachedProducts;
+
+  try { config = await api('/config'); } catch (e) { console.warn('Config load failed, using defaults', e); }
 
   document.getElementById('app').innerHTML = renderShell();
   document.getElementById('app').style.display = 'block';
@@ -112,8 +185,35 @@ async function init() {
   updateCartBadge();
   goTab('shop');
   if (window.lucide) lucide.createIcons();
+  renderOfflineIndicator();
 
+  await refreshCategoriesAndProducts();
   if (customerId) refreshNotifications();
+}
+
+async function refreshCategoriesAndProducts() {
+  if (!isOnline) return; // cached categories/products (if any) already rendered by init()
+  try {
+    const [freshCategories, freshProducts] = await Promise.all([api('/categories'), api('/products')]);
+    categories = freshCategories;
+    products = freshProducts;
+    cacheSet('categories', categories);
+    cacheSet('products', products);
+    // Silently update whatever's currently on screen.
+    if (currentTab === 'shop') {
+      const html = currentCategory ? renderProductList() : renderCategoryGrid();
+      const mEl = document.getElementById('mContent'), dEl = document.getElementById('dContent');
+      if (mEl) mEl.innerHTML = html;
+      if (dEl) dEl.innerHTML = html;
+      if (window.lucide) lucide.createIcons();
+    }
+  } catch (e) {
+    // Fetch failed — keep whatever's cached/already rendered on screen.
+    // Only show the empty state if we truly have nothing at all.
+    if (!categories.length && !products.length) {
+      toast('Could not load shop data. Check your connection.', 'error');
+    }
+  }
 }
 
 // ── SHELL (mobile + desktop) ───────────────────────────────────
@@ -605,11 +705,22 @@ async function lookupOrders() {
 async function loadOrders() {
   const c = customerContact || {};
   if (!c.email && !c.phone) return;
+
+  const cached = cacheGet('orders');
+  if (cached) { orders = cached; renderOrdersList(); }
+
+  if (!isOnline) return; // don't fire a request we know will fail; cached data (if any) stays on screen
+
   try {
     const result = await api('/orders/lookup', 'POST', { email: c.email, phone: c.phone });
     orders = result.orders || [];
+    cacheSet('orders', orders);
     renderOrdersList();
-  } catch (e) { /* silent on tab switch */ }
+  } catch (e) {
+    // Fetch failed — keep cached orders on screen if we have them;
+    // only fall through to the empty state if there's truly nothing.
+    if (!cached) renderOrdersList();
+  }
 }
 function renderOrdersList() {
   const el = document.getElementById('ordersList');
@@ -744,6 +855,7 @@ async function linkTelegram() {
 }
 function clearAccountData() {
   showConfirm('Forget your info?', 'This clears your saved name, email, and phone from this device. Your order history stays on our records and can be looked up again by email or phone.', () => {
+    clearCustomerCache();
     localStorage.removeItem('qs_contact'); localStorage.removeItem('qs_customer_id');
     customerContact = null; customerId = null;
     toast('Cleared', 'success');
@@ -751,14 +863,35 @@ function clearAccountData() {
   });
 }
 
-// ── NOTIFICATIONS MODAL ────────────────────────────────────────
+// ── NOTIFICATIONS MODAL (hybrid historical cache) ─────────────────
+// The server prunes notifications older than its retention window
+// (see backend daily cleanup), so older entries are preserved here in
+// localStorage and merged with fresh server data on every load. The
+// merged result is de-duplicated by id, sorted newest first, and
+// capped at NOTIF_CACHE_CAP entries so localStorage never grows unbounded.
+function mergeNotifications(cached, fresh) {
+  const byId = new Map();
+  [...(cached || []), ...(fresh || [])].forEach(n => byId.set(n.id, n)); // fresh entries overwrite cached (e.g. is_read updates)
+  return [...byId.values()]
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, NOTIF_CACHE_CAP);
+}
 async function refreshNotifications() {
   if (!customerId) return;
-  try {
-    notifications = await api(`/customer/notifications?customer_id=${customerId}`);
+  const cached = cacheGet('notifications');
+  if (cached) {
+    notifications = cached;
     const hasUnread = notifications.some(n => !n.is_read);
     document.querySelectorAll('.notif-dot').forEach(el => el.classList.toggle('show', hasUnread));
-  } catch (e) { /* silent */ }
+  }
+  if (!isOnline) return; // skip the network call entirely; cached notifications (if any) stay visible
+  try {
+    const fresh = await api(`/customer/notifications?customer_id=${customerId}`);
+    notifications = mergeNotifications(cached, fresh);
+    cacheSet('notifications', notifications);
+    const hasUnread = notifications.some(n => !n.is_read);
+    document.querySelectorAll('.notif-dot').forEach(el => el.classList.toggle('show', hasUnread));
+  } catch (e) { /* offline or failed — cached notifications (if any) stay on screen */ }
 }
 function openNotifModal() {
   document.getElementById('modalRoot').innerHTML = `

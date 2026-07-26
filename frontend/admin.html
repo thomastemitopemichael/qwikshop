@@ -140,6 +140,7 @@ textarea.fi{resize:vertical;font-family:'DM Sans',sans-serif;font-size:13px}
   <div class="login-card">
     <div class="login-logo"><h1>🛍️ QuickShop Admin</h1><p>Sign in to manage your shop</p></div>
     <div class="login-warn" id="loginWarn"></div>
+    <div class="fg"><label class="fl">API URL</label><input type="text" class="fi" id="apiUrlInput" placeholder="https://your-app.onrender.com/api"></div>
     <div class="fg"><label class="fl">Admin Key</label><input type="password" class="fi" id="adminKeyInput" placeholder="Enter admin key" onkeydown="if(event.key==='Enter')doLogin()"></div>
     <button class="btn bp full" id="loginBtn" onclick="doLogin()">Sign In</button>
   </div>
@@ -147,7 +148,7 @@ textarea.fi{resize:vertical;font-family:'DM Sans',sans-serif;font-size:13px}
 
 <div id="appScreen">
   <div class="topbar">
-    <div class="topbar-brand"><button class="ham-btn" onclick="toggleMobNav()">☰</button><span class="conn-dot" id="connDot"></span><h1>🛍️ QuickShop Admin</h1></div>
+    <div class="topbar-brand"><button class="ham-btn" onclick="toggleMobNav()">☰</button><span class="conn-dot" id="connDot"></span><span id="connLabel" style="font-size:11px;color:var(--txt3);margin-right:4px"></span><h1>🛍️ QuickShop Admin</h1></div>
     <div class="topbar-r"><button class="btn bg bs" onclick="doLogout()">Sign Out</button></div>
   </div>
   <div class="app-body">
