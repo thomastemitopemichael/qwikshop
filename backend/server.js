@@ -1,5 +1,5 @@
 /**
- * QuickShop Backend — v1.0.0
+ * Qwikshop Backend — v1.0.0
  * Category-based shop: catalog browsing with bulk/tiered pricing,
  * autonomous catalog ordering (auto-confirm + stock decrement),
  * restock & custom pre-orders (admin-priced), scheduled orders,
@@ -47,7 +47,7 @@ function initTelegramBot() {
         await supabaseAdmin.from("telegram_link_codes").insert({ chat_id: chatId, code, expires_at: expiresAt });
         try {
           await tgBot.sendMessage(chatId,
-            `🛍️ *QuickShop — Link Your Account*\n\nYour one-time linking code is:\n\n*${code}*\n\nEnter this code in the app → Settings → Link Telegram.\n_Code expires in 10 minutes._`,
+            `🛍️ *Qwikshop — Link Your Account*\n\nYour one-time linking code is:\n\n*${code}*\n\nEnter this code in the app → Settings → Link Telegram.\n_Code expires in 10 minutes._`,
             { parse_mode: "Markdown" });
         } catch (e) { console.error("[Telegram /start reply error]", e.message); }
       }
@@ -88,7 +88,7 @@ async function getAllowedChannels() {
   const list = raw.split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
   return { email: list.includes("email"), sms: list.includes("sms"), push: list.includes("push"), telegram: list.includes("telegram"), list };
 }
-const fromEmail = () => process.env.FROM_EMAIL || "QuickShop <onboarding@resend.dev>";
+const fromEmail = () => process.env.FROM_EMAIL || "Qwikshop <onboarding@resend.dev>";
 async function sendEmailRaw(to, subject, html, text) { try { const r = await resend.emails.send({ from: fromEmail(), to: [to], subject, html, text }); return { success: true, id: r.data?.id }; } catch (err) { return { success: false, error: err.message }; } }
 
 async function sendSms(phone, message) {
@@ -128,7 +128,7 @@ async function notifyCustomer(customerId, type, title, message) {
     const allowed = await getAllowedChannels();
     const pref = c.notify_preference;
     if (allowed.email && prefHas(pref, "email") && c.email) {
-      await sendEmailRaw(c.email, title, `<!DOCTYPE html><html><body style="margin:0;padding:40px 20px;background:#080C10;font-family:sans-serif"><div style="max-width:520px;margin:0 auto;background:#0F1419;border-radius:16px;border:1px solid #1E2D42;overflow:hidden"><div style="background:#0A0F15;padding:20px 24px;border-bottom:1px solid #1E2D42"><span style="font-size:17px;font-weight:700;color:#E2EAF5">🛍️ QuickShop</span></div><div style="padding:24px"><h2 style="margin:0 0 10px;color:#E2EAF5;font-size:16px">${title}</h2><p style="color:#7E97B8;font-size:13px;line-height:1.6;margin:0">${message}</p></div></div></body></html>`, message);
+      await sendEmailRaw(c.email, title, `<!DOCTYPE html><html><body style="margin:0;padding:40px 20px;background:#080C10;font-family:sans-serif"><div style="max-width:520px;margin:0 auto;background:#0F1419;border-radius:16px;border:1px solid #1E2D42;overflow:hidden"><div style="background:#0A0F15;padding:20px 24px;border-bottom:1px solid #1E2D42"><span style="font-size:17px;font-weight:700;color:#E2EAF5">🛍️ Qwikshop</span></div><div style="padding:24px"><h2 style="margin:0 0 10px;color:#E2EAF5;font-size:16px">${title}</h2><p style="color:#7E97B8;font-size:13px;line-height:1.6;margin:0">${message}</p></div></div></body></html>`, message);
     }
     if (allowed.sms && prefHas(pref, "sms") && c.phone) await sendSms(c.phone, `${title}: ${message}`);
     if (allowed.push && prefHas(pref, "push")) await sendPush(customerId, title, message);
@@ -158,6 +158,19 @@ async function optionalAuth(req, res, next) {
     req.customerAuth = data.user;
     next();
   } catch { req.customerAuth = null; next(); }
+}
+// Checkout requires a real, verified session (mandatory sign-in at
+// checkout only — browsing, cart, and pre-orders stay fully guest-friendly).
+async function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: "Please sign in to complete checkout." });
+  try {
+    const token = authHeader.replace("Bearer ", "");
+    const { data, error } = await supabaseAnon.auth.getUser(token);
+    if (error || !data?.user) return res.status(401).json({ error: "Your session has expired — please sign in again." });
+    req.customerAuth = data.user;
+    next();
+  } catch { return res.status(401).json({ error: "Please sign in to complete checkout." }); }
 }
 // Admin auth (shared secret key header, matches reference app's admin pattern)
 function requireAdmin(req, res, next) {
@@ -204,10 +217,121 @@ async function resolveCustomer({ auth_id, name, email, phone }) {
 
 app.get("/health", (req, res) => res.json({ ok: true, version: "1.0.0" }));
 
+// ═══════════════════════════════════════════════════════════════
+// AUTH — custom 8+ char alphanumeric sign-in code, backed by real
+// Supabase sessions. Sign-in is required only at checkout; browsing,
+// cart, and pre-orders remain guest-friendly throughout.
+// ═══════════════════════════════════════════════════════════════
+const AUTH_CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // excludes ambiguous 0/O, 1/I/L
+function generateAuthCode(length = 8) {
+  let code = "";
+  const bytes = crypto.randomBytes(length);
+  for (let i = 0; i < length; i++) code += AUTH_CODE_CHARS[bytes[i] % AUTH_CODE_CHARS.length];
+  return code;
+}
+function hashAuthCode(code, email) {
+  // Salted with the email so the same code string never hashes the same
+  // way across two different sign-in attempts/emails.
+  return crypto.createHash("sha256").update(`${email.toLowerCase().trim()}:${code.toUpperCase()}`).digest("hex");
+}
+
+app.post("/api/auth/request-code", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "Please enter a valid email address." });
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const s = await getSettings();
+    const resendSeconds = parseInt(s.auth_code_resend_seconds || "60");
+    const expiryMinutes = parseInt(s.auth_code_expiry_minutes || "10");
+
+    // Rate-limit: don't allow a new code if one was requested too recently.
+    const { data: recent } = await supabaseAdmin.from("auth_codes").select("created_at").eq("email", normalizedEmail).order("created_at", { ascending: false }).limit(1).single();
+    if (recent && (Date.now() - new Date(recent.created_at).getTime()) < resendSeconds * 1000) {
+      const waitSeconds = Math.ceil(resendSeconds - (Date.now() - new Date(recent.created_at).getTime()) / 1000);
+      return res.status(429).json({ error: `Please wait ${waitSeconds}s before requesting another code.` });
+    }
+
+    const code = generateAuthCode(8);
+    const codeHash = hashAuthCode(code, normalizedEmail);
+    const expiresAt = new Date(Date.now() + expiryMinutes * 60000).toISOString();
+    await supabaseAdmin.from("auth_codes").insert({ email: normalizedEmail, code_hash: codeHash, expires_at: expiresAt });
+
+    const shopName = s.shop_name || "Qwikshop";
+    await sendEmailRaw(normalizedEmail, `Your ${shopName} sign-in code`,
+      `<!DOCTYPE html><html><body style="margin:0;padding:40px 20px;background:#080C10;font-family:sans-serif"><div style="max-width:480px;margin:0 auto;background:#0F1419;border-radius:16px;border:1px solid #1E2D42;overflow:hidden"><div style="background:#0A0F15;padding:20px 24px;border-bottom:1px solid #1E2D42"><span style="font-size:17px;font-weight:700;color:#E2EAF5">🛍️ ${shopName}</span></div><div style="padding:24px;text-align:center"><p style="color:#7E97B8;font-size:13px;margin:0 0 16px">Your sign-in code:</p><div style="font-family:monospace;font-size:28px;font-weight:700;letter-spacing:4px;color:#3B82F6;background:#161D27;border-radius:10px;padding:16px;margin-bottom:16px">${code}</div><p style="color:#4A6080;font-size:12px;margin:0">This code expires in ${expiryMinutes} minutes. If you didn't request this, you can ignore this email.</p></div></div></body></html>`,
+      `Your ${shopName} sign-in code is: ${code} (expires in ${expiryMinutes} minutes)`);
+
+    res.json({ success: true, expires_in_minutes: expiryMinutes });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/auth/verify-code", async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: "Email and code are required." });
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const s = await getSettings();
+    const maxAttempts = parseInt(s.auth_code_max_attempts || "5");
+
+    const { data: authCode } = await supabaseAdmin.from("auth_codes").select("*").eq("email", normalizedEmail).eq("used", false).order("created_at", { ascending: false }).limit(1).single();
+    if (!authCode) return res.status(400).json({ error: "No pending code found — please request a new one." });
+    if (new Date(authCode.expires_at) < new Date()) return res.status(400).json({ error: "This code has expired — please request a new one." });
+    if (authCode.attempts >= maxAttempts) return res.status(400).json({ error: "Too many incorrect attempts — please request a new code." });
+
+    const submittedHash = hashAuthCode(code, normalizedEmail);
+    if (submittedHash !== authCode.code_hash) {
+      await supabaseAdmin.from("auth_codes").update({ attempts: authCode.attempts + 1 }).eq("id", authCode.id);
+      const remaining = maxAttempts - (authCode.attempts + 1);
+      return res.status(400).json({ error: remaining > 0 ? `Incorrect code — ${remaining} attempt${remaining !== 1 ? "s" : ""} left.` : "Too many incorrect attempts — please request a new code." });
+    }
+
+    await supabaseAdmin.from("auth_codes").update({ used: true }).eq("id", authCode.id);
+
+    // Find-or-create the Supabase auth user for this email, then mint a
+    // real session server-side (Option 2: backend completes the exchange
+    // itself and hands the frontend finished tokens — no hash/exchange
+    // logic needed client-side, matching how the rest of this app works).
+    let userId;
+    const { data: existingUsers } = await supabaseAdmin.auth.admin.listUsers();
+    const existingUser = existingUsers?.users?.find(u => u.email?.toLowerCase() === normalizedEmail);
+    if (existingUser) {
+      userId = existingUser.id;
+    } else {
+      const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({ email: normalizedEmail, email_confirm: true });
+      if (createErr) throw createErr;
+      userId = created.user.id;
+    }
+
+    const { data: linkData, error: linkErr } = await supabaseAdmin.auth.admin.generateLink({ type: "magiclink", email: normalizedEmail });
+    if (linkErr) throw linkErr;
+    const tokenHash = linkData?.properties?.hashed_token;
+    if (!tokenHash) throw new Error("Could not establish a session — please try again.");
+
+    // Complete the exchange server-side using the anon client, so the
+    // frontend receives ready-to-use tokens rather than a hash to exchange.
+    const { data: sessionData, error: sessionErr } = await supabaseAnon.auth.verifyOtp({ token_hash: tokenHash, type: "magiclink" });
+    if (sessionErr || !sessionData?.session) throw new Error("Could not establish a session — please try again.");
+
+    const customer = await resolveCustomer({ auth_id: userId, email: normalizedEmail });
+
+    res.json({
+      access_token: sessionData.session.access_token,
+      refresh_token: sessionData.session.refresh_token,
+      customer_id: customer.id,
+      email: normalizedEmail,
+      name: customer.name || null,
+      phone: customer.phone || null,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 app.get("/api/config", async (req, res) => {
   const s = await getSettings();
   res.json({
-    shop_name: s.shop_name || "QuickShop",
+    shop_name: s.shop_name || "Qwikshop",
     currency_symbol: s.currency_symbol || "₦",
     min_lead_time_hours: parseInt(s.min_lead_time_hours || "2"),
     min_order_value: parseInt(s.min_order_value || "0"),
@@ -298,8 +422,10 @@ async function checkRateLimit(customerId) {
 // the response tells the customer what changed — no admin needed.
 async function catalogOrderHandler(req, res) {
   try {
-    const { name, email, phone, items, payment_method, scheduled_for, notify_preference } = req.body;
-    if (!email && !phone) return res.status(400).json({ error: "Email or phone is required" });
+    const { name, phone, items, payment_method, scheduled_for, notify_preference } = req.body;
+    // requireAuth guarantees req.customerAuth exists with a verified email —
+    // that's the identity of record for checkout, not whatever the client sends.
+    const email = req.customerAuth.email;
     if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: "At least one item is required" });
 
     const s = await getSettings();
@@ -312,7 +438,7 @@ async function catalogOrderHandler(req, res) {
       if (lead < minLeadHours) return res.status(400).json({ error: `Scheduled orders need at least ${minLeadHours}h lead time.` });
     }
 
-    const customer = await resolveCustomer({ auth_id: req.customerAuth?.id, name, email, phone });
+    const customer = await resolveCustomer({ auth_id: req.customerAuth.id, name, email, phone });
     if (customer.is_blocked) return res.status(403).json({ error: "Your account is currently unable to place orders. Please contact the shop." });
     if (notify_preference) await supabaseAdmin.from("customers").update({ notify_preference }).eq("id", customer.id);
 
@@ -384,7 +510,7 @@ async function catalogOrderHandler(req, res) {
     res.status(201).json({ order, adjusted: adjustedLines, total, customer_id: customer.id });
   } catch (err) { res.status(500).json({ error: err.message }); }
 }
-app.post("/api/orders/catalog", optionalAuth, catalogOrderHandler);
+app.post("/api/orders/catalog", requireAuth, catalogOrderHandler);
 
 // ── PRE-ORDERS: restock (tied to existing product) ────────────────
 app.post("/api/orders/preorder/restock", optionalAuth, async (req, res) => {
@@ -488,7 +614,7 @@ app.get("/api/orders/:id", async (req, res) => {
 });
 
 // ── REORDER — re-place a past catalog order as a new one ──────────
-app.post("/api/orders/:id/reorder", optionalAuth, async (req, res) => {
+app.post("/api/orders/:id/reorder", requireAuth, async (req, res) => {
   try {
     const { data: original } = await supabaseAdmin.from("orders").select("*, order_items(*)").eq("id", req.params.id).single();
     if (!original) return res.status(404).json({ error: "Original order not found" });
@@ -496,11 +622,13 @@ app.post("/api/orders/:id/reorder", optionalAuth, async (req, res) => {
 
     const { data: customer } = await supabaseAdmin.from("customers").select("*").eq("id", original.customer_id).single();
     if (!customer) return res.status(404).json({ error: "Customer not found" });
+    // Only the signed-in owner of the original order can reorder it.
+    if (customer.auth_id && customer.auth_id !== req.customerAuth.id) return res.status(403).json({ error: "You can only reorder your own past orders." });
 
     const items = original.order_items.filter(i => i.product_id).map(i => ({ product_id: i.product_id, quantity: i.quantity }));
     if (!items.length) return res.status(400).json({ error: "No reorderable items found." });
 
-    const fakeReq = { body: { email: customer.email, phone: customer.phone, name: customer.name, items, payment_method: req.body.payment_method || original.payment_method }, customerAuth: req.customerAuth };
+    const fakeReq = { body: { name: customer.name, phone: customer.phone, items, payment_method: req.body.payment_method || original.payment_method }, customerAuth: req.customerAuth };
     return catalogOrderHandler(fakeReq, res);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1037,7 +1165,7 @@ cron.schedule("0 3 * * *", runDailyCleanup);
 
 const PORT = parseInt(process.env.PORT) || 4000;
 app.listen(PORT, "0.0.0.0", async () => {
-  console.log(`QuickShop API v1.0.0 on port ${PORT}`);
+  console.log(`Qwikshop API v1.0.0 on port ${PORT}`);
   await scheduleCrons();
   initTelegramBot();
 });
