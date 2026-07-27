@@ -1,13 +1,16 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>QuickShop Admin</title>
+<title>Qwikshop Admin</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#080C10;--bg2:#0F1419;--bg3:#161D27;--bg4:#1C2535;--border:#1E2D42;--border2:#263650;--txt:#E2EAF5;--txt2:#7E97B8;--txt3:#4A6080;--card:#0F1419;--inp:#161D27;--blue:#3B82F6;--blue2:#1D4ED8;--bbg:rgba(59,130,246,.1);--bbd:rgba(59,130,246,.25);--green:#10B981;--gbg:rgba(16,185,129,.1);--gbd:rgba(16,185,129,.25);--amber:#F59E0B;--abg:rgba(245,158,11,.1);--abd:rgba(245,158,11,.25);--red:#EF4444;--rbg:rgba(239,68,68,.1);--rbd:rgba(239,68,68,.25);--purple:#8B5CF6;--pbg:rgba(139,92,246,.1);--pbd:rgba(139,92,246,.25);--r:8px;--r2:12px;--r3:16px;--ease:cubic-bezier(.4,0,.2,1)}
+html{color-scheme:dark light}
+[data-theme="dark"]{--bg:#080C10;--bg2:#0F1419;--bg3:#161D27;--bg4:#1C2535;--border:#1E2D42;--border2:#263650;--txt:#E2EAF5;--txt2:#7E97B8;--txt3:#4A6080;--card:#0F1419;--inp:#161D27}
+[data-theme="light"]{--bg:#EEF2F8;--bg2:#FFFFFF;--bg3:#F4F7FC;--bg4:#E8EEF8;--border:#D0DBF0;--border2:#B8CCE8;--txt:#0A1628;--txt2:#3D5A80;--txt3:#7A95B8;--card:#FFFFFF;--inp:#F4F7FC}
+:root{--blue:#3B82F6;--blue2:#1D4ED8;--bbg:rgba(59,130,246,.1);--bbd:rgba(59,130,246,.25);--green:#10B981;--gbg:rgba(16,185,129,.1);--gbd:rgba(16,185,129,.25);--amber:#F59E0B;--abg:rgba(245,158,11,.1);--abd:rgba(245,158,11,.25);--red:#EF4444;--rbg:rgba(239,68,68,.1);--rbd:rgba(239,68,68,.25);--purple:#8B5CF6;--pbg:rgba(139,92,246,.1);--pbd:rgba(139,92,246,.25);--r:8px;--r2:12px;--r3:16px;--ease:cubic-bezier(.4,0,.2,1)}
 html,body{height:100%}
 body{background:var(--bg);color:var(--txt);font-family:'DM Sans',sans-serif;display:flex;flex-direction:column}
 h1,h2,h3{font-family:'Syne',sans-serif}
@@ -138,7 +141,7 @@ textarea.fi{resize:vertical;font-family:'DM Sans',sans-serif;font-size:13px}
 
 <div id="loginScreen">
   <div class="login-card">
-    <div class="login-logo"><h1>🛍️ QuickShop Admin</h1><p>Sign in to manage your shop</p></div>
+    <div class="login-logo"><h1>🛍️ Qwikshop Admin</h1><p>Sign in to manage your shop</p></div>
     <div class="login-warn" id="loginWarn"></div>
     <div class="fg"><label class="fl">API URL</label><input type="text" class="fi" id="apiUrlInput" placeholder="https://your-app.onrender.com/api"></div>
     <div class="fg"><label class="fl">Admin Key</label><input type="password" class="fi" id="adminKeyInput" placeholder="Enter admin key" onkeydown="if(event.key==='Enter')doLogin()"></div>
@@ -148,19 +151,19 @@ textarea.fi{resize:vertical;font-family:'DM Sans',sans-serif;font-size:13px}
 
 <div id="appScreen">
   <div class="topbar">
-    <div class="topbar-brand"><button class="ham-btn" onclick="toggleMobNav()">☰</button><span class="conn-dot" id="connDot"></span><span id="connLabel" style="font-size:11px;color:var(--txt3);margin-right:4px"></span><h1>🛍️ QuickShop Admin</h1></div>
-    <div class="topbar-r"><button class="btn bg bs" onclick="doLogout()">Sign Out</button></div>
+    <div class="topbar-brand"><button class="ham-btn" onclick="toggleMobNav()">☰</button><span class="conn-dot" id="connDot"></span><span id="connLabel" style="font-size:11px;color:var(--txt3);margin-right:4px"></span><h1>🛍️ Qwikshop Admin</h1></div>
+    <div class="topbar-r"><button class="btn bg bs" id="themeToggleBtn" onclick="toggleTheme()">🌙</button><button class="btn bg bs" onclick="doLogout()">Sign Out</button></div>
   </div>
   <div class="app-body">
     <div class="sidebar">
-      <div class="nav-item act" data-pg="overview" onclick="showPage('overview')"><span class="nav-icon">📊</span>Overview</div>
-      <div class="nav-item" data-pg="orders" onclick="showPage('orders')"><span class="nav-icon">📦</span>Orders <span class="nav-badge" id="ordersBadge" style="display:none">0</span></div>
-      <div class="nav-item" data-pg="products" onclick="showPage('products')"><span class="nav-icon">🛒</span>Products</div>
-      <div class="nav-item" data-pg="categories" onclick="showPage('categories')"><span class="nav-icon">🏷️</span>Categories</div>
-      <div class="nav-item" data-pg="customers" onclick="showPage('customers')"><span class="nav-icon">👥</span>Customers</div>
-      <div class="nav-item" data-pg="analytics" onclick="showPage('analytics')"><span class="nav-icon">📈</span>Analytics</div>
-      <div class="nav-item" data-pg="notifications" onclick="showPage('notifications')"><span class="nav-icon">🔔</span>Broadcast</div>
-      <div class="nav-item" data-pg="settings" onclick="showPage('settings')"><span class="nav-icon">⚙️</span>Settings</div>
+      <div class="nav-item act" data-pg="overview" onclick="showPage('overview')"><span class="nav-icon"><i data-lucide="layout-dashboard" style="width:16px;height:16px"></i></span>Overview</div>
+      <div class="nav-item" data-pg="orders" onclick="showPage('orders')"><span class="nav-icon"><i data-lucide="package" style="width:16px;height:16px"></i></span>Orders <span class="nav-badge" id="ordersBadge" style="display:none">0</span></div>
+      <div class="nav-item" data-pg="products" onclick="showPage('products')"><span class="nav-icon"><i data-lucide="shopping-cart" style="width:16px;height:16px"></i></span>Products</div>
+      <div class="nav-item" data-pg="categories" onclick="showPage('categories')"><span class="nav-icon"><i data-lucide="tag" style="width:16px;height:16px"></i></span>Categories</div>
+      <div class="nav-item" data-pg="customers" onclick="showPage('customers')"><span class="nav-icon"><i data-lucide="users" style="width:16px;height:16px"></i></span>Customers</div>
+      <div class="nav-item" data-pg="analytics" onclick="showPage('analytics')"><span class="nav-icon"><i data-lucide="trending-up" style="width:16px;height:16px"></i></span>Analytics</div>
+      <div class="nav-item" data-pg="notifications" onclick="showPage('notifications')"><span class="nav-icon"><i data-lucide="bell" style="width:16px;height:16px"></i></span>Broadcast</div>
+      <div class="nav-item" data-pg="settings" onclick="showPage('settings')"><span class="nav-icon"><i data-lucide="settings" style="width:16px;height:16px"></i></span>Settings</div>
     </div>
     <div class="main-area" id="mainArea">
       <!-- pages injected by JS -->
@@ -168,11 +171,17 @@ textarea.fi{resize:vertical;font-family:'DM Sans',sans-serif;font-size:13px}
   </div>
   <div class="mob-nav">
     <div class="mob-nav-items">
-      <button class="mob-nav-item act" data-pg="overview" onclick="showPage('overview')"><span class="mni">📊</span>Home</button>
-      <button class="mob-nav-item" data-pg="orders" onclick="showPage('orders')"><span class="mni">📦</span>Orders</button>
-      <button class="mob-nav-item" data-pg="products" onclick="showPage('products')"><span class="mni">🛒</span>Products</button>
-      <button class="mob-nav-item" data-pg="customers" onclick="showPage('customers')"><span class="mni">👥</span>Customers</button>
-      <button class="mob-nav-item" data-pg="settings" onclick="showPage('settings')"><span class="mni">⚙️</span>Settings</button>
+      <button class="mob-nav-item act" data-pg="overview" onclick="showPage('overview')"><span class="mni"><i data-lucide="layout-dashboard" style="width:17px;height:17px"></i></span>Home</button>
+      <button class="mob-nav-item" data-pg="orders" onclick="showPage('orders')"><span class="mni"><i data-lucide="package" style="width:17px;height:17px"></i></span>Orders</button>
+      <button class="mob-nav-item" data-pg="products" onclick="showPage('products')"><span class="mni"><i data-lucide="shopping-cart" style="width:17px;height:17px"></i></span>Products</button>
+      <button class="mob-nav-item" data-pg="customers" onclick="showPage('customers')"><span class="mni"><i data-lucide="users" style="width:17px;height:17px"></i></span>Customers</button>
+      <button class="mob-nav-item" id="moreNavBtn" onclick="toggleMoreMenu()"><span class="mni"><i data-lucide="more-horizontal" style="width:17px;height:17px"></i></span>More</button>
+    </div>
+    <div id="moreMenu" style="display:none;position:fixed;bottom:calc(56px + env(safe-area-inset-bottom,6px));left:12px;right:12px;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r2);padding:8px;z-index:151;box-shadow:0 -4px 20px rgba(0,0,0,.3)">
+      <button class="mob-nav-item" style="flex-direction:row;justify-content:flex-start;gap:10px;width:100%;padding:10px 12px;font-size:12px;text-transform:none;letter-spacing:0" data-pg="categories" onclick="showPage('categories');toggleMoreMenu()"><span class="mni"><i data-lucide="tag" style="width:15px;height:15px"></i></span>Categories</button>
+      <button class="mob-nav-item" style="flex-direction:row;justify-content:flex-start;gap:10px;width:100%;padding:10px 12px;font-size:12px;text-transform:none;letter-spacing:0" data-pg="analytics" onclick="showPage('analytics');toggleMoreMenu()"><span class="mni"><i data-lucide="trending-up" style="width:15px;height:15px"></i></span>Analytics</button>
+      <button class="mob-nav-item" style="flex-direction:row;justify-content:flex-start;gap:10px;width:100%;padding:10px 12px;font-size:12px;text-transform:none;letter-spacing:0" data-pg="notifications" onclick="showPage('notifications');toggleMoreMenu()"><span class="mni"><i data-lucide="bell" style="width:15px;height:15px"></i></span>Broadcast</button>
+      <button class="mob-nav-item" style="flex-direction:row;justify-content:flex-start;gap:10px;width:100%;padding:10px 12px;font-size:12px;text-transform:none;letter-spacing:0" data-pg="settings" onclick="showPage('settings');toggleMoreMenu()"><span class="mni"><i data-lucide="settings" style="width:15px;height:15px"></i></span>Settings</button>
     </div>
   </div>
 </div>

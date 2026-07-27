@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// QuickShop — Customer App
+// Qwikshop — Customer App
 // ═══════════════════════════════════════════════════════════════
 // The native app shell injects window.QUICKSHOP_API_BASE before this
 // script runs (WebView preload script / JS bridge global). There is no
@@ -8,8 +8,20 @@
 // or a hardcoded fallback until the native bridge is wired up.
 const API_BASE = window.QUICKSHOP_API_BASE || 'https://qwikshop.onrender.com/api';
 
+// Supabase client — used only for holding/refreshing the session once
+// signed in (via our own custom-code /api/auth/verify-code endpoint,
+// not Supabase's native OTP UI). The anon key is safe to expose
+// client-side by design; both values can be injected the same way as
+// QUICKSHOP_API_BASE, with hardcoded fallbacks until that's wired up.
+const SUPABASE_URL = window.QUICKSHOP_SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = window.QUICKSHOP_SUPABASE_ANON_KEY || '';
+let supabaseClient = null;
+if (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY) {
+  supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false } });
+}
+
 // ── STATE ──────────────────────────────────────────────────────
-let config = { shop_name: 'QuickShop', currency_symbol: '₦', min_lead_time_hours: 2, min_order_value: 0, delivery_fee: 0 };
+let config = { shop_name: 'Qwikshop', currency_symbol: '₦', min_lead_time_hours: 2, min_order_value: 0, delivery_fee: 0 };
 let categories = [];
 let products = [];
 let cart = JSON.parse(localStorage.getItem('qs_cart') || '[]'); // [{product_id, name, qty, tiers}]
@@ -22,10 +34,15 @@ let orders = [];
 let isOnline = navigator.onLine;
 const NOTIF_CACHE_CAP = 100;
 
+// ── AUTH SESSION STATE ─────────────────────────────────────────────
+let authSession = null; // { access_token, refresh_token } once signed in
+let authPendingEmail = null; // email awaiting code entry, mid sign-in flow
+
 // ── API HELPERS (15s hard timeout via AbortController) ───────────
 const REQUEST_TIMEOUT_MS = 15000;
 async function api(path, method = 'GET', body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (authSession?.access_token) opts.headers['Authorization'] = `Bearer ${authSession.access_token}`;
   if (body) opts.body = JSON.stringify(body);
   const controller = new AbortController();
   opts.signal = controller.signal;
@@ -48,6 +65,52 @@ async function api(path, method = 'GET', body) {
     if (err instanceof TypeError) setOnlineState(false); // network-level failure
     throw err;
   }
+}
+
+// ── AUTH (custom 8+ char sign-in code, real Supabase session) ────
+// Sign-in is required only at checkout; browsing, cart, and pre-orders
+// stay fully guest-friendly. Session is persisted via Supabase's own
+// client-side storage once established, refreshed automatically.
+function restoreSession() {
+  try {
+    const raw = localStorage.getItem('qs_auth_session');
+    if (!raw) return;
+    authSession = JSON.parse(raw);
+    if (supabaseClient && authSession?.access_token && authSession?.refresh_token) {
+      supabaseClient.auth.setSession({ access_token: authSession.access_token, refresh_token: authSession.refresh_token });
+    }
+  } catch { authSession = null; }
+}
+function persistSession(session) {
+  authSession = session;
+  localStorage.setItem('qs_auth_session', JSON.stringify(session));
+}
+function isSignedIn() { return !!authSession?.access_token; }
+
+async function requestSignInCode(email) {
+  const result = await api('/auth/request-code', 'POST', { email });
+  authPendingEmail = email;
+  return result;
+}
+async function verifySignInCode(email, code) {
+  const result = await api('/auth/verify-code', 'POST', { email, code });
+  persistSession({ access_token: result.access_token, refresh_token: result.refresh_token });
+  if (supabaseClient) supabaseClient.auth.setSession({ access_token: result.access_token, refresh_token: result.refresh_token });
+  customerId = result.customer_id;
+  customerContact = { name: result.name, email: result.email, phone: result.phone };
+  localStorage.setItem('qs_customer_id', customerId);
+  localStorage.setItem('qs_contact', JSON.stringify(customerContact));
+  authPendingEmail = null;
+  refreshNotifications();
+  return result;
+}
+function signOut() {
+  authSession = null;
+  authPendingEmail = null;
+  localStorage.removeItem('qs_auth_session');
+  if (supabaseClient) supabaseClient.auth.signOut();
+  toast('Signed out', 'info');
+  goTab('account');
 }
 
 // ── ONLINE / OFFLINE AWARENESS ────────────────────────────────────
@@ -157,20 +220,39 @@ function updateCartQty(productId, qty) {
   renderCartModal();
 }
 function updateCartBadge() {
-  const badge = document.getElementById('cartCount');
-  if (badge) { badge.textContent = cartCount(); badge.style.display = cartCount() > 0 ? 'flex' : 'none'; }
-  const fab = document.getElementById('cartFab');
-  if (fab) {
-    if (cartCount() > 0) { fab.classList.remove('hidden'); document.getElementById('cartFabText').textContent = `${cartCount()} item${cartCount() !== 1 ? 's' : ''} · ${money(cartTotal())}`; }
-    else fab.classList.add('hidden');
+  const count = cartCount();
+  ['cartCount', 'cartCountD'].forEach(id => {
+    const badge = document.getElementById(id);
+    if (badge) { badge.textContent = count; badge.style.display = count > 0 ? 'flex' : 'none'; }
+  });
+  // If the Cart tab is currently open, keep its contents live as the cart changes.
+  if (currentTab === 'cart') {
+    const html = renderCartPage();
+    const mEl = document.getElementById('mContent'), dEl = document.getElementById('dContent');
+    if (mEl) mEl.innerHTML = html;
+    if (dEl) dEl.innerHTML = html;
+    if (window.lucide) lucide.createIcons();
   }
 }
+
+// ── THEME TOGGLE ──────────────────────────────────────────────────
+function applyAppTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem('qs_theme', theme);
+  document.querySelectorAll('#themeTabDark, #themeTabLight').forEach(el => el && el.classList.remove('active'));
+  const activeTab = document.getElementById(theme === 'dark' ? 'themeTabDark' : 'themeTabLight');
+  if (activeTab) activeTab.classList.add('active');
+}
+function setAppTheme(theme) { applyAppTheme(theme); }
 
 // ── INIT (stale-while-revalidate) ─────────────────────────────────
 // Render cached data instantly if present, then refresh in the
 // background and silently update the UI. Data arrays are only ever
 // reset to empty if the fetch fails AND there's no cache at all.
 async function init() {
+  applyAppTheme(localStorage.getItem('qs_theme') || 'dark');
+  restoreSession();
+
   const cachedCategories = cacheGet('categories');
   const cachedProducts = cacheGet('products');
   if (cachedCategories) categories = cachedCategories;
@@ -224,19 +306,15 @@ function renderShell() {
       <div class="m-logo"><i data-lucide="shopping-bag" style="width:20px;height:20px;color:var(--blue)"></i><span class="m-logo-txt">${esc(config.shop_name)}</span></div>
       <div class="m-top-r">
         <button class="notif-btn" onclick="openNotifModal()"><i data-lucide="bell" style="width:15px;height:15px"></i><span class="notif-dot" id="notifDotM"></span></button>
-        <button class="cart-btn" onclick="openCartModal()"><i data-lucide="shopping-cart" style="width:15px;height:15px"></i><span class="cart-count" id="cartCount" style="display:none">0</span></button>
       </div>
     </div>
     <div class="m-content" id="mContent"></div>
     <div class="m-bot">
       <button class="m-nb act" data-tab="shop" onclick="goTab('shop')"><span class="m-ni"><i data-lucide="store" style="width:19px;height:19px"></i></span>Shop</button>
+      <button class="m-nb" data-tab="cart" onclick="goTab('cart')"><span class="m-ni" style="position:relative"><i data-lucide="shopping-cart" style="width:19px;height:19px"></i><span class="cart-count" id="cartCount" style="display:none;position:absolute;top:-6px;right:-8px">0</span></span>Cart</button>
       <button class="m-nb" data-tab="preorder" onclick="goTab('preorder')"><span class="m-ni"><i data-lucide="clipboard-list" style="width:19px;height:19px"></i></span>Request</button>
       <button class="m-nb" data-tab="orders" onclick="goTab('orders')"><span class="m-ni"><i data-lucide="package" style="width:19px;height:19px"></i></span>Orders</button>
       <button class="m-nb" data-tab="account" onclick="goTab('account')"><span class="m-ni"><i data-lucide="user" style="width:19px;height:19px"></i></span>Account</button>
-    </div>
-    <div class="cart-fab hidden" id="cartFab" onclick="openCartModal()">
-      <span><i data-lucide="shopping-cart" style="width:16px;height:16px;vertical-align:middle;margin-right:6px"></i><span id="cartFabText"></span></span>
-      <i data-lucide="arrow-right" style="width:16px;height:16px"></i>
     </div>
   </div>
 
@@ -245,6 +323,7 @@ function renderShell() {
       <div class="d-logo"><i data-lucide="shopping-bag" style="width:22px;height:22px;color:var(--blue)"></i><span class="d-logo-txt">${esc(config.shop_name)}</span></div>
       <div class="d-nav">
         <div class="d-nitem act" data-tab="shop" onclick="goTab('shop')"><i data-lucide="store" style="width:16px;height:16px"></i>Shop</div>
+        <div class="d-nitem" data-tab="cart" onclick="goTab('cart')"><i data-lucide="shopping-cart" style="width:16px;height:16px"></i>Cart<span class="cart-count" id="cartCountD" style="display:none;margin-left:auto;position:static">0</span></div>
         <div class="d-nitem" data-tab="preorder" onclick="goTab('preorder')"><i data-lucide="clipboard-list" style="width:16px;height:16px"></i>Request an Item</div>
         <div class="d-nitem" data-tab="orders" onclick="goTab('orders')"><i data-lucide="package" style="width:16px;height:16px"></i>My Orders</div>
         <div class="d-nitem" data-tab="account" onclick="goTab('account')"><i data-lucide="user" style="width:16px;height:16px"></i>Account</div>
@@ -255,7 +334,6 @@ function renderShell() {
         <span class="d-title" id="dTitle">Shop</span>
         <div style="display:flex;gap:8px;align-items:center">
           <button class="notif-btn" onclick="openNotifModal()"><i data-lucide="bell" style="width:15px;height:15px"></i><span class="notif-dot" id="notifDotD"></span></button>
-          <button class="cart-btn" onclick="openCartModal()"><i data-lucide="shopping-cart" style="width:15px;height:15px"></i><span class="cart-count" id="cartCountD" style="display:none">0</span></button>
         </div>
       </div>
       <div class="d-content" id="dContent"></div>
@@ -270,10 +348,11 @@ function renderShell() {
 function goTab(tab) {
   currentTab = tab;
   document.querySelectorAll('.m-nb, .d-nitem').forEach(el => el.classList.toggle('act', el.dataset.tab === tab));
-  const titles = { shop: 'Shop', preorder: 'Request an Item', orders: 'My Orders', account: 'Account' };
+  const titles = { shop: 'Shop', cart: 'Your Cart', preorder: 'Request an Item', orders: 'My Orders', account: 'Account' };
   const dTitle = document.getElementById('dTitle'); if (dTitle) dTitle.textContent = titles[tab];
   let html = '';
   if (tab === 'shop') html = currentCategory ? renderProductList() : renderCategoryGrid();
+  else if (tab === 'cart') html = renderCartPage();
   else if (tab === 'preorder') html = renderPreorderForm();
   else if (tab === 'orders') html = renderOrdersPage();
   else if (tab === 'account') html = renderAccountPage();
@@ -281,12 +360,25 @@ function goTab(tab) {
   document.getElementById('dContent').innerHTML = html;
   if (window.lucide) lucide.createIcons();
   if (tab === 'orders') loadOrders();
+  if (tab === 'account') applyAppTheme(localStorage.getItem('qs_theme') || 'dark'); // refresh theme tab active state on freshly-rendered markup
 }
 
 // ── CATEGORY GRID ──────────────────────────────────────────────
+let shopSearchQuery = '';
 function renderCategoryGrid() {
-  if (!categories.length) return `<div class="empty"><div class="empty-icon"><i data-lucide="store" style="width:34px;height:34px"></i></div><h3>No categories yet</h3><p>Check back soon.</p></div>`;
-  return `
+  const searchBar = `
+    <div class="fg" style="margin-bottom:14px">
+      <div style="position:relative">
+        <i data-lucide="search" style="width:15px;height:15px;position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--txt3)"></i>
+        <input class="fi" style="padding-left:34px" id="shopSearchInput" placeholder="Search the catalogue..." value="${esc(shopSearchQuery)}" oninput="onShopSearchInput(this.value)">
+        ${shopSearchQuery ? `<button onclick="clearShopSearch()" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--txt3);cursor:pointer;padding:4px"><i data-lucide="x" style="width:14px;height:14px"></i></button>` : ''}
+      </div>
+    </div>`;
+
+  if (shopSearchQuery.trim()) return searchBar + renderSearchResults();
+
+  if (!categories.length) return searchBar + `<div class="empty"><div class="empty-icon"><i data-lucide="store" style="width:34px;height:34px"></i></div><h3>No categories yet</h3><p>Check back soon.</p></div>`;
+  return searchBar + `
     <div class="section-title">Browse Categories</div>
     <div class="cat-grid">
       ${categories.map(c => {
@@ -298,6 +390,28 @@ function renderCategoryGrid() {
         </div>`;
       }).join('')}
     </div>`;
+}
+function renderSearchResults() {
+  const q = shopSearchQuery.trim().toLowerCase();
+  const matches = products.filter(p => (p.name || '').toLowerCase().includes(q) || (p.description || '').toLowerCase().includes(q));
+  if (!matches.length) return `<div class="empty"><div class="empty-icon"><i data-lucide="search-x" style="width:30px;height:30px"></i></div><h3>No matches</h3><p>Try a different search term.</p></div>`;
+  return `<div class="section-title">${matches.length} result${matches.length !== 1 ? 's' : ''} for "${esc(shopSearchQuery.trim())}"</div>` + matches.map(p => renderProductCard(p, true)).join('');
+}
+function onShopSearchInput(value) {
+  shopSearchQuery = value;
+  // Re-render just the content area (not the whole shell) to keep focus in the input.
+  const html = renderCategoryGrid();
+  const mEl = document.getElementById('mContent'), dEl = document.getElementById('dContent');
+  if (mEl) mEl.innerHTML = html;
+  if (dEl) dEl.innerHTML = html;
+  if (window.lucide) lucide.createIcons();
+  // Restore focus + cursor position since innerHTML replacement resets it.
+  const input = document.getElementById('shopSearchInput');
+  if (input) { input.focus(); input.setSelectionRange(value.length, value.length); }
+}
+function clearShopSearch() {
+  shopSearchQuery = '';
+  onShopSearchInput('');
 }
 function openCategory(id) {
   currentCategory = categories.find(c => c.id === id);
@@ -326,7 +440,7 @@ function renderProductList() {
   `;
 }
 
-function renderProductCard(p) {
+function renderProductCard(p, showCategoryTag) {
   const tiers = p.product_price_tiers || [];
   const cheapest = cheapestTier(tiers);
   const inCart = cart.find(i => i.product_id === p.id);
@@ -334,11 +448,13 @@ function renderProductCard(p) {
   const stockBadge = p.stock_count <= 0 ? `<span class="badge b-outstock"><span class="bdot"></span>Out of stock</span>`
     : p.stock_count <= p.low_stock_threshold ? `<span class="badge b-lowstock"><span class="bdot"></span>${p.stock_count} left</span>`
     : `<span class="badge b-instock"><span class="bdot"></span>In stock</span>`;
+  const category = showCategoryTag ? categories.find(c => c.id === p.category_id) : null;
 
   return `
   <div class="prod-card" id="prod-${p.id}">
     <div class="prod-head">
       <div>
+        ${category ? `<div class="fhint" style="margin-bottom:2px">${esc(category.icon)} ${esc(category.name)}</div>` : ''}
         <div class="prod-name">${esc(p.name)}</div>
         ${p.description ? `<div class="prod-desc">${esc(p.description)}</div>` : ''}
       </div>
@@ -380,18 +496,21 @@ function addProductToCart(productId) {
   if (el) el.textContent = 1;
 }
 
-// ── CART MODAL ───────────────────────────────────────────────────
+// ── CART (tab + modal, sharing the same body renderer) ────────────
+function renderCartPage() {
+  return `<div class="section-title">Your Cart</div>${renderCartBody(false)}`;
+}
 function openCartModal() {
   document.getElementById('modalRoot').innerHTML = `
     <div class="overlay open" id="cartOverlay" onclick="if(event.target===this)closeModal('cartOverlay')">
       <div class="modal">
         <div class="mhead"><span class="mtitle">Your Cart</span><button class="mclose" onclick="closeModal('cartOverlay')">&times;</button></div>
-        <div id="cartModalBody">${renderCartBody()}</div>
+        <div id="cartModalBody">${renderCartBody(true)}</div>
       </div>
     </div>`;
   if (window.lucide) lucide.createIcons();
 }
-function renderCartBody() {
+function renderCartBody(inModal) {
   if (!cart.length) return `<div class="empty"><div class="empty-icon"><i data-lucide="shopping-cart" style="width:30px;height:30px"></i></div><h3>Your cart is empty</h3><p>Browse categories to add items.</p></div>`;
   const rows = cart.map(item => {
     const product = products.find(p => p.id === item.product_id);
@@ -412,38 +531,86 @@ function renderCartBody() {
       <div class="cart-item-price">${money(lineTotal)}</div>
     </div>`;
   }).join('');
+  const checkoutBtn = inModal
+    ? `<button class="btn bp full" style="margin-top:16px" onclick="switchModal('cartOverlay', openCheckoutModal)">Checkout <i data-lucide="arrow-right" style="width:14px;height:14px"></i></button>`
+    : `<button class="btn bp full" style="margin-top:16px" onclick="openCheckoutModal()">Checkout <i data-lucide="arrow-right" style="width:14px;height:14px"></i></button>`;
   return `
     ${rows}
     ${config.delivery_fee > 0 ? `<div class="cart-item"><div class="cart-item-name">Delivery fee</div><div class="cart-item-price">${money(config.delivery_fee)}</div></div>` : ''}
     <div class="cart-total-row"><span>Total</span><span>${money(cartTotal())}</span></div>
     ${config.min_order_value > 0 && cartTotal() < config.min_order_value ? `<div class="fhint" style="color:var(--amber);margin-top:8px">Minimum order is ${money(config.min_order_value)}.</div>` : ''}
-    <button class="btn bp full" style="margin-top:16px" onclick="closeModal('cartOverlay');openCheckoutModal()">Checkout <i data-lucide="arrow-right" style="width:14px;height:14px"></i></button>
+    ${checkoutBtn}
   `;
 }
 function renderCartModal() {
   const body = document.getElementById('cartModalBody');
-  if (body) body.innerHTML = renderCartBody();
+  if (body) body.innerHTML = renderCartBody(true);
   if (window.lucide) lucide.createIcons();
 }
+let _modalWipeTimer = null;
 function closeModal(id) {
   const el = document.getElementById(id);
-  if (el) { el.classList.remove('open'); setTimeout(() => { document.getElementById('modalRoot').innerHTML = ''; }, 200); }
+  if (el) el.classList.remove('open');
+  // Cancel any previously-scheduled wipe before scheduling a new one — otherwise
+  // a stale wipe (from a modal that's since been replaced by a new one, e.g.
+  // cart → checkout) can fire after the new modal has already been rendered
+  // into the same #modalRoot, deleting it right after it appears.
+  if (_modalWipeTimer) clearTimeout(_modalWipeTimer);
+  _modalWipeTimer = setTimeout(() => {
+    // Only wipe if nothing else has re-opened a modal in the meantime.
+    if (!document.querySelector('#modalRoot .overlay.open')) {
+      document.getElementById('modalRoot').innerHTML = '';
+    }
+    _modalWipeTimer = null;
+  }, 200);
+}
+function switchModal(closeId, openFn) {
+  // Use this instead of chaining closeModal(x); openFn() directly in onclick
+  // handlers — it cancels the old modal's pending wipe immediately since
+  // we're replacing #modalRoot's content right away, then opens the next
+  // modal on the next frame so its "open" transition still animates in.
+  if (_modalWipeTimer) { clearTimeout(_modalWipeTimer); _modalWipeTimer = null; }
+  const el = document.getElementById(closeId);
+  if (el) el.classList.remove('open');
+  requestAnimationFrame(openFn);
 }
 
 // ── CHECKOUT MODAL ─────────────────────────────────────────────
 function openCheckoutModal() {
   if (!cart.length) { toast('Your cart is empty', 'warn'); return; }
-  const c = customerContact || {};
   document.getElementById('modalRoot').innerHTML = `
     <div class="overlay open" id="checkoutOverlay" onclick="if(event.target===this)closeModal('checkoutOverlay')">
       <div class="modal">
         <div class="mhead"><span class="mtitle">Checkout</span><button class="mclose" onclick="closeModal('checkoutOverlay')">&times;</button></div>
+        <div id="checkoutModalBody">${isSignedIn() ? renderCheckoutForm() : renderCheckoutSignInGate()}</div>
+      </div>
+    </div>`;
+  if (isSignedIn()) wireCheckoutFormEvents();
+  if (window.lucide) lucide.createIcons();
+}
+
+// Sign-in is required only at this final step — browsing, cart, and
+// pre-orders never require it. Once verified, the same modal swaps
+// straight into the checkout form without losing the cart.
+function renderCheckoutSignInGate() {
+  return `
+    <p class="fhint" style="margin-bottom:14px">Sign in to complete checkout — this keeps your order history synced across devices. It's only needed here; browsing and requests never require it.</p>
+    <div id="checkoutSignInArea">${renderSignInStep()}</div>
+  `;
+}
+function refreshCheckoutModalAfterAuth() {
+  // Called after a successful sign-in that happened inside the checkout
+  // modal specifically (as opposed to the Account tab's own sign-in flow).
+  const body = document.getElementById('checkoutModalBody');
+  if (body) { body.innerHTML = renderCheckoutForm(); wireCheckoutFormEvents(); if (window.lucide) lucide.createIcons(); }
+}
+
+function renderCheckoutForm() {
+  const c = customerContact || {};
+  return `
         <div class="fg"><label class="fl">Name</label><input class="fi" id="coName" placeholder="Your name" value="${esc(c.name || '')}"></div>
-        <div class="fr">
-          <div class="fg"><label class="fl">Email</label><input class="fi" id="coEmail" type="email" placeholder="you@example.com" value="${esc(c.email || '')}"></div>
-          <div class="fg"><label class="fl">Phone</label><input class="fi" id="coPhone" type="tel" placeholder="0801..." value="${esc(c.phone || '')}"></div>
-        </div>
-        <div class="fhint" style="margin:-6px 0 12px">We need at least one of email or phone to send order updates.</div>
+        <div class="fg"><label class="fl">Phone</label><input class="fi" id="coPhone" type="tel" placeholder="0801..." value="${esc(c.phone || '')}"></div>
+        <div class="fhint" style="margin:-6px 0 12px">Signed in as ${esc(c.email || '')} — order updates go here automatically.</div>
 
         <div class="fg">
           <label class="fl">Notify me via</label>
@@ -472,12 +639,12 @@ function openCheckoutModal() {
 
         <div class="cart-total-row"><span>Total</span><span>${money(cartTotal())}</span></div>
         <button class="btn bp full" style="margin-top:16px" id="placeOrderBtn" onclick="submitCatalogOrder()">Place Order</button>
-      </div>
-    </div>`;
+  `;
+}
+function wireCheckoutFormEvents() {
   document.querySelectorAll('#notifPrefGroup .nopt').forEach(el => {
     el.addEventListener('click', () => { el.classList.toggle('sel'); el.querySelector('input').checked = el.classList.contains('sel'); });
   });
-  if (window.lucide) lucide.createIcons();
 }
 let orderTiming = 'asap', orderPayMethod = 'pay_on_pickup';
 function setOrderTiming(t) {
@@ -494,10 +661,9 @@ function setPayMethod(m) {
 }
 
 async function submitCatalogOrder() {
+  if (!isSignedIn()) { toast('Please sign in to complete checkout', 'error'); return; }
   const name = document.getElementById('coName').value.trim();
-  const email = document.getElementById('coEmail').value.trim();
   const phone = document.getElementById('coPhone').value.trim();
-  if (!email && !phone) { toast('Please provide an email or phone number', 'error'); return; }
   const scheduledEl = document.getElementById('coScheduled');
   const scheduled_for = orderTiming === 'later' && scheduledEl.value ? new Date(scheduledEl.value).toISOString() : null;
   if (orderTiming === 'later' && !scheduled_for) { toast('Please pick a date and time', 'error'); return; }
@@ -510,8 +676,10 @@ async function submitCatalogOrder() {
   btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Placing order...';
 
   try {
-    const result = await api('/orders/catalog', 'POST', { name, email, phone, items, payment_method: orderPayMethod, scheduled_for, notify_preference });
-    customerContact = { name, email, phone };
+    // email is not sent — the backend derives identity from the signed-in
+    // session's verified token (requireAuth), not from freeform form fields.
+    const result = await api('/orders/catalog', 'POST', { name, phone, items, payment_method: orderPayMethod, scheduled_for, notify_preference });
+    customerContact = { ...(customerContact || {}), name: name || customerContact?.name, phone: phone || customerContact?.phone };
     customerId = result.customer_id;
     localStorage.setItem('qs_contact', JSON.stringify(customerContact));
     localStorage.setItem('qs_customer_id', customerId);
@@ -675,11 +843,11 @@ async function submitPreorder() {
 // ── ORDERS PAGE ────────────────────────────────────────────────
 function renderOrdersPage() {
   const c = customerContact || {};
-  if (!c.email && !c.phone) {
+  if (!isSignedIn() && !c.email && !c.phone) {
     return `
       <div class="section-title">My Orders</div>
       <div class="card" style="padding:18px">
-        <p class="fhint" style="margin-bottom:12px">Enter your email or phone to look up your orders.</p>
+        <p class="fhint" style="margin-bottom:12px">Enter your email or phone to look up a guest order or pre-order request, or sign in from the Account tab to see your orders automatically.</p>
         <div class="fr">
           <div class="fg"><label class="fl">Email</label><input class="fi" id="lookupEmail" type="email"></div>
           <div class="fg"><label class="fl">Phone</label><input class="fi" id="lookupPhone" type="tel"></div>
@@ -704,7 +872,7 @@ async function lookupOrders() {
 }
 async function loadOrders() {
   const c = customerContact || {};
-  if (!c.email && !c.phone) return;
+  if (!isSignedIn() && !c.email && !c.phone) return;
 
   const cached = cacheGet('orders');
   if (cached) { orders = cached; renderOrdersList(); }
@@ -712,6 +880,9 @@ async function loadOrders() {
   if (!isOnline) return; // don't fire a request we know will fail; cached data (if any) stays on screen
 
   try {
+    // While signed in, api() attaches the session token and the backend
+    // resolves orders via the authenticated customer first — email/phone
+    // in the body are only a fallback for guests.
     const result = await api('/orders/lookup', 'POST', { email: c.email, phone: c.phone });
     orders = result.orders || [];
     cacheSet('orders', orders);
@@ -806,16 +977,47 @@ async function reorderOrder(orderId) {
 // ── ACCOUNT PAGE ───────────────────────────────────────────────
 function renderAccountPage() {
   const c = customerContact || {};
-  if (!c.email && !c.phone) {
-    return `<div class="section-title">Account</div><div class="empty"><div class="empty-icon"><i data-lucide="user" style="width:30px;height:30px"></i></div><h3>No account info yet</h3><p>Place an order or submit a request to set up your contact details.</p></div>`;
+  const themeCard = `
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <div style="font-weight:600;font-size:13px">Appearance</div>
+        <div class="seg" style="margin:0">
+          <button type="button" class="seg-tab" id="themeTabDark" onclick="setAppTheme('dark')">🌙 Dark</button>
+          <button type="button" class="seg-tab" id="themeTabLight" onclick="setAppTheme('light')">☀️ Light</button>
+        </div>
+      </div>
+    </div>`;
+
+  const signInCard = isSignedIn() ? `
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
+        <div style="font-weight:600">${esc(c.name || c.email || 'Signed in')}</div>
+        <span class="badge b-instock"><span class="bdot"></span>Signed in</span>
+      </div>
+      ${c.email ? `<div class="fhint">${esc(c.email)}</div>` : ''}
+      ${c.phone ? `<div class="fhint">${esc(c.phone)}</div>` : ''}
+      <button class="btn bg bs" style="margin-top:10px" onclick="signOut()"><i data-lucide="log-out" style="width:13px;height:13px"></i>Sign Out</button>
+    </div>` : `
+    <div class="card" style="padding:16px;margin-bottom:14px">
+      <div style="font-weight:600;margin-bottom:4px;font-size:13px">Sign in</div>
+      <p class="fhint" style="margin-bottom:12px">Sign in to sync your orders across devices. You can browse and submit requests without signing in — it's only needed to complete checkout.</p>
+      <div id="signInFormArea">${renderSignInStep()}</div>
+    </div>`;
+
+  if (!isSignedIn() && !c.email && !c.phone) {
+    return `<div class="section-title">Account</div>${signInCard}${themeCard}`;
   }
   return `
     <div class="section-title">Account</div>
+    ${signInCard}
+    ${themeCard}
+    ${!isSignedIn() ? `
     <div class="card" style="padding:16px;margin-bottom:14px">
       <div style="font-weight:600;margin-bottom:2px">${esc(c.name || 'Guest')}</div>
       ${c.email ? `<div class="fhint">${esc(c.email)}</div>` : ''}
       ${c.phone ? `<div class="fhint">${esc(c.phone)}</div>` : ''}
-    </div>
+      <div class="fhint" style="margin-top:6px">Saved from a previous guest order or request on this device.</div>
+    </div>` : ''}
 
     <div class="card" style="padding:16px;margin-bottom:14px">
       <div style="font-weight:600;margin-bottom:10px;font-size:13px">Notification Channels</div>
@@ -838,6 +1040,62 @@ function renderAccountPage() {
     <button class="btn bd full" onclick="clearAccountData()"><i data-lucide="log-out" style="width:14px;height:14px"></i>Forget My Info On This Device</button>
   `;
 }
+
+// ── SIGN-IN FLOW (email → 8-char code → session) ──────────────────
+function renderSignInStep() {
+  if (authPendingEmail) {
+    return `
+      <div class="fg"><label class="fl">Enter the code sent to ${esc(authPendingEmail)}</label><input class="fi" id="signInCodeInput" placeholder="8-character code" maxlength="8" style="text-transform:uppercase;letter-spacing:2px;font-family:'DM Mono',monospace" autofocus></div>
+      <button class="btn bp full" id="verifyCodeBtn" onclick="submitVerifyCode()">Verify & Sign In</button>
+      <button class="btn bg full" style="margin-top:8px" onclick="cancelSignIn()">Use a different email</button>
+    `;
+  }
+  return `
+    <div class="fg"><label class="fl">Email</label><input class="fi" id="signInEmailInput" type="email" placeholder="you@example.com"></div>
+    <button class="btn bp full" id="requestCodeBtn" onclick="submitRequestCode()">Send Sign-In Code</button>
+  `;
+}
+function activeSignInContainer() {
+  return document.getElementById('checkoutSignInArea') || document.getElementById('signInFormArea');
+}
+async function submitRequestCode() {
+  const email = document.getElementById('signInEmailInput').value.trim();
+  if (!email) { toast('Enter your email', 'error'); return; }
+  const btn = document.getElementById('requestCodeBtn');
+  btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Sending...';
+  try {
+    await requestSignInCode(email);
+    toast('Code sent — check your email', 'success');
+    const area = activeSignInContainer();
+    if (area) area.innerHTML = renderSignInStep();
+    if (window.lucide) lucide.createIcons();
+  } catch (e) {
+    toast(e.message, 'error');
+    btn.disabled = false; btn.innerHTML = 'Send Sign-In Code';
+  }
+}
+async function submitVerifyCode() {
+  const code = document.getElementById('signInCodeInput').value.trim();
+  if (!code) { toast('Enter the code from your email', 'error'); return; }
+  const btn = document.getElementById('verifyCodeBtn');
+  btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Verifying...';
+  const inCheckout = !!document.getElementById('checkoutSignInArea');
+  try {
+    await verifySignInCode(authPendingEmail, code);
+    toast('Signed in!', 'success');
+    if (inCheckout) refreshCheckoutModalAfterAuth();
+    else goTab('account');
+  } catch (e) {
+    toast(e.message, 'error');
+    btn.disabled = false; btn.innerHTML = 'Verify & Sign In';
+  }
+}
+function cancelSignIn() {
+  authPendingEmail = null;
+  const area = activeSignInContainer();
+  if (area) area.innerHTML = renderSignInStep();
+}
+
 async function saveNotifPrefs() {
   const selected = [...document.querySelectorAll('#accountNotifGroup .nopt.sel')].map(el => el.dataset.ch);
   if (!customerId) { toast('Place an order first to create your profile', 'warn'); return; }

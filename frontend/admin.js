@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// QuickShop Admin — admin.js
+// Qwikshop Admin — admin.js
 // ═══════════════════════════════════════════════════════════════
 // API_BASE is set at login time from the "API URL" field (saved to
 // localStorage so staff don't retype it every session), rather than
@@ -83,8 +83,21 @@ function resolveConfirm(val) {
   if (_confirmResolve) { _confirmResolve(val); _confirmResolve = null; }
 }
 
+// ── THEME TOGGLE ──────────────────────────────────────────────────
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const btn = document.getElementById('themeToggleBtn');
+  if (btn) btn.textContent = theme === 'dark' ? '🌙' : '☀️';
+  localStorage.setItem('qs_admin_theme', theme);
+}
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme') || 'dark';
+  applyTheme(current === 'dark' ? 'light' : 'dark');
+}
+
 // ── AUTH ─────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
+  applyTheme(localStorage.getItem('qs_admin_theme') || 'dark');
   const urlInput = document.getElementById('apiUrlInput');
   if (urlInput && API_BASE) urlInput.value = API_BASE;
 });
@@ -127,11 +140,25 @@ async function boot() {
 }
 
 function toggleMobNav() { document.querySelector('.sidebar').classList.toggle('open'); }
+function toggleMoreMenu() {
+  const menu = document.getElementById('moreMenu');
+  if (!menu) return;
+  const isOpen = menu.style.display === 'block';
+  menu.style.display = isOpen ? 'none' : 'block';
+}
+// Close the "More" menu if the user taps elsewhere on the page.
+document.addEventListener('click', (e) => {
+  const menu = document.getElementById('moreMenu');
+  const btn = document.getElementById('moreNavBtn');
+  if (!menu || menu.style.display !== 'block') return;
+  if (!menu.contains(e.target) && e.target !== btn && !btn?.contains(e.target)) menu.style.display = 'none';
+});
 
 function showPage(pg) {
   document.querySelectorAll('.nav-item, .mob-nav-item').forEach(el => el.classList.toggle('act', el.dataset.pg === pg));
   const renderers = { overview: renderOverviewPage, orders: renderOrdersPage, products: renderProductsPage, categories: renderCategoriesPage, customers: renderCustomersPage, analytics: renderAnalyticsPage, notifications: renderNotificationsPage, settings: renderSettingsPage };
   document.getElementById('mainArea').innerHTML = renderers[pg] ? renderers[pg]() : '';
+  if (window.lucide) lucide.createIcons();
   const loaders = { overview: loadOverview, orders: () => loadOrders(currentOrderTab), products: loadProducts, categories: loadCategories, customers: loadCustomers, analytics: loadAnalytics, settings: loadSettings };
   if (loaders[pg] && isOnline) loaders[pg]();
 }
